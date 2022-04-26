@@ -1,0 +1,13 @@
+data:
+  data_path: '/mnt/nfs/home/aiilyas/store/cifar_datamodels/models_1/regression_data.beton'
+  num_train: 90000 
+  num_val: 10000
+cfg:
+  k: 100
+  out_dir: '/tmp'
+  batch_size: 1000
+  lr: 1e-2
+  true_random: true
+early_stopping:
+  check_every: 5
+  eps: 1e-12
