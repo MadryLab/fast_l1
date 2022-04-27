@@ -124,7 +124,8 @@ def train_saga(weight, bias, loader, val_loader, *,
                early_stop_freq=2, early_stop_eps=1e-5,
                cox_store: Store = None,
                logdir: str = None,
-               update_bias=True):
+               update_bias=True,
+               dynamic_resize=True):
     largest_ind, n_ex = get_num_examples(loader)
     zeros = tensor_factory(ch.float32, weight.device)
     bool_zeros = tensor_factory(ch.bool, weight.device)
@@ -141,7 +142,7 @@ def train_saga(weight, bias, loader, val_loader, *,
             'lambda': (np.float32, num_outputs),
             'weight_norm': (np.float32, num_outputs),
             'done_optimizing_inner': (np.bool_, num_outputs),
-            'done_optimizing_outer': (np.bool_, num_outputs)
+            'still_optimizing_outer': (np.bool_, num_outputs)
         }, cnk_size=100_000)
 
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
@@ -154,8 +155,9 @@ def train_saga(weight, bias, loader, val_loader, *,
     residual = zeros(batch_size, num_outputs)
 
     # w_norm = zeros(num_outputs)
-    done_optimizing_inner = bool_zeros(num_outputs)
-    done_optimizing_outer = bool_zeros(num_outputs)
+    done_opt_inner = bool_zeros(num_outputs)
+    still_opt_outer = ~bool_zeros(num_outputs)
+    last_resizer = ch.arange(num_outputs)
     got_worse = bool_zeros(num_outputs)
 
     X = zeros(batch_size, num_inputs)
@@ -173,12 +175,16 @@ def train_saga(weight, bias, loader, val_loader, *,
     # This is for logging
     train_losses = zeros(num_outputs)
     total_train_losses = zeros(num_outputs)
+
+    w_cpu = ch.zeros_like(weight, device=ch.device('cpu'))
+    b_cpu = ch.zeros_like(bias, device=ch.device('cpu'))
     try:
         while True:
             iterator = tqdm(loader)
             thr = None
             prev_w[:] = weight
             for bool_X, y, idx in iterator:
+                y = y[:, last_resizer]
                 # Previous residuals
                 a_prev = a_table[idx].cuda(non_blocking=True)
                 X.copy_(bool_X)
@@ -232,14 +238,14 @@ def train_saga(weight, bias, loader, val_loader, *,
             prev_w.pow_(2)
             prev_w *= mm_sig.pow(2)[:, None]
             ch.max(prev_w, dim=0, out=(deltas, deltas_inds))
-            ch.lt(deltas, early_stop_eps, out=done_optimizing_inner)
+            ch.lt(deltas, early_stop_eps, out=done_opt_inner)
 
             data_to_log = {
                 'train_mse': total_train_losses / n_ex,
                 'val_mse': last_mse,
                 'lambda': lam,
-                'done_optimizing_inner': done_optimizing_inner,
-                'done_optimizing_outer': done_optimizing_outer
+                'done_optimizing_inner': done_opt_inner,
+                'still_optimizing_outer': still_opt_outer
             }
             if logger is not None:
                 for name, value in data_to_log.items():
@@ -258,8 +264,8 @@ def train_saga(weight, bias, loader, val_loader, *,
                         })
                 """
 
-                lambdas_done += (done_optimizing_inner & ~done_optimizing_outer)
-                done_optimizing_outer[lambdas_done == num_lambdas] = True
+                lambdas_done += (done_opt_inner & still_opt_outer)
+                still_opt_outer[lambdas_done == num_lambdas] = False
 
                 # New value of the MSE
                 new_mse = eval_saga(weight, bias, val_loader,
@@ -267,21 +273,36 @@ def train_saga(weight, bias, loader, val_loader, *,
                                     num_inputs, num_outputs)
 
                 # Of the indices done optimizing, see if val loss got worse
-                got_worse[:] = (new_mse > last_mse) & done_optimizing_inner
+                got_worse[:] = (new_mse > last_mse) & done_opt_inner
 
                 # Wherever it got worse, stop optimizing and decrement lambda
-                lam[got_worse & ~done_optimizing_outer] /= lam_decay
-                done_optimizing_outer[got_worse] = True
+                lam[got_worse & still_opt_outer] /= lam_decay
+                still_opt_outer[got_worse] = False
 
                 # Wherever we are done, update the val mse and lambda
-                last_mse[done_optimizing_inner] = new_mse[done_optimizing_inner]
-                lam[done_optimizing_inner & ~done_optimizing_outer] *= lam_decay
-                done_optimizing_inner[:] = False
+                last_mse[done_opt_inner] = new_mse[done_opt_inner]
+                lam[done_opt_inner & still_opt_outer] *= lam_decay
+                done_opt_inner[:] = False
 
             total_train_losses[:] = 0.
-            if ch.all(ch.logical_or(lambdas_done >= num_lambdas, done_optimizing_outer)):
+            if ch.all(~still_opt_outer):
                 break
-            
+            elif dynamic_resize and ch.mean(still_opt_outer.float()) < 0.9:
+                print('Resizing stuff...')
+                w_cpu[:, last_resizer] = weight[:, still_opt_outer]
+                b_cpu[:, last_resizer] = bias[still_opt_outer]
+
+                last_resizer = last_resizer[still_opt_outer]
+                a_table = a_table[:, still_opt_outer]
+                shuttle = shuttle[:, still_opt_outer]
+                w_grad_avg = w_grad_avg[:, still_opt_outer]
+                w_saga = w_saga[:, still_opt_outer]
+                b_grad_avg = b_grad_avg[still_opt_outer]
+                done_opt_inner = done_opt_inner[still_opt_outer]
+                still_opt_outer = still_opt_outer[still_opt_outer]
+                weight = weight[:, still_opt_outer]
+                bias = bias[still_opt_outer]
+
             nnz = weight.nonzero().shape[0]
             total = weight.shape[0]
             print(f"epoch: {t} | delta: {deltas.mean()} | "
