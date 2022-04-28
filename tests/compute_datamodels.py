@@ -128,6 +128,7 @@ def main(lr: float, k: int, eps: float, out_dir: str,
         'bias': bias.cpu(),
     }, os.path.join(out_dir, f'datamodels.pt'))
 
+
 if __name__ == '__main__':
     config = get_current_config()
     parser = ArgumentParser(description='Datamodel regression')

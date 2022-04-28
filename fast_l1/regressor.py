@@ -1,12 +1,13 @@
 from threading import Thread
+from typing import Optional
 
 import numpy as np
 import torch as ch
 from tqdm import tqdm
 from cupy import ElementwiseKernel
-from cox.store import Store, PICKLE
 
 from fast_l1.logger import Logger
+from fast_l1.fastmm import extract_columns, selective_matmul, selective_addmm, write_columns
 
 kernel = ElementwiseKernel(
     'float32 data, float32 lamb',
@@ -122,10 +123,8 @@ def tensor_factory(dtype, device):
 def train_saga(weight, bias, loader, val_loader, *,
                lr, start_lams, lam_decay, num_lambdas,
                early_stop_freq=2, early_stop_eps=1e-5,
-               cox_store: Store = None,
-               logdir: str = None,
-               update_bias=True,
-               dynamic_resize=True):
+               logdir: Optional[str] = None,
+               update_bias=True):
     largest_ind, n_ex = get_num_examples(loader)
     zeros = tensor_factory(ch.float32, weight.device)
     bool_zeros = tensor_factory(ch.bool, weight.device)
@@ -143,21 +142,23 @@ def train_saga(weight, bias, loader, val_loader, *,
             'weight_norm': (np.float32, num_outputs),
             'done_optimizing_inner': (np.bool_, num_outputs),
             'still_optimizing_outer': (np.bool_, num_outputs)
-        }, cnk_size=100_000)
+        }, cnk_size=10_000)
 
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
+    a_buffer_cpu = zeros(batch_size, num_outputs).cpu().pin_memory()
+    a_buffer_gpu = zeros(batch_size, num_outputs)
 
     w_grad_avg = zeros(*weight.shape)
     w_saga = zeros(*weight.shape)
     b_grad_avg = zeros(*bias.shape)
+    b_saga = zeros(*bias.shape)
 
     residual = zeros(batch_size, num_outputs)
 
     # w_norm = zeros(num_outputs)
     done_opt_inner = bool_zeros(num_outputs)
     still_opt_outer = ~bool_zeros(num_outputs)
-    last_resizer = ch.arange(num_outputs)
     got_worse = bool_zeros(num_outputs)
 
     X = zeros(batch_size, num_inputs)
@@ -176,33 +177,63 @@ def train_saga(weight, bias, loader, val_loader, *,
     train_losses = zeros(num_outputs)
     total_train_losses = zeros(num_outputs)
 
-    w_cpu = ch.zeros_like(weight, device=ch.device('cpu'))
-    b_cpu = ch.zeros_like(bias, device=ch.device('cpu'))
+    # These are buffers for fastmm
+    weight_buf = ch.zeros_like(weight)
+    bias_buf = ch.zeros_like(bias)
+    y_buf = zeros(batch_size, num_outputs)
+
+    a_prev = zeros(batch_size, num_outputs)
+
+    # REMOVE THIS
+    still_opt_outer[:] = False
+    real_inds = ch.randperm(10000)[:10000]
+    still_opt_outer[real_inds] = True 
+    # indices = ch.where(still_opt_outer)[0].cpu()
+    # num_keep = 1000
+
     try:
         while True:
             iterator = tqdm(loader)
             thr = None
             prev_w[:] = weight
             for bool_X, y, idx in iterator:
-                y = y[:, last_resizer]
+                indices = ch.where(still_opt_outer)[0]
+                cpu_indices = indices.cpu()
+                num_keep = len(indices)
+
                 # Previous residuals
-                a_prev = a_table[idx].cuda(non_blocking=True)
+                a_buffer_gpu.copy_(a_table[idx], non_blocking=True)
+                a_prev[:, :num_keep].copy_(a_buffer_gpu[:, still_opt_outer],
+                                           non_blocking=True)
+                # cpu_idx = idx.cpu()
+                # a_prev[:, :num_keep].copy_(a_table[cpu_idx][:, cpu_indices], non_blocking=True)
+
                 X.copy_(bool_X)
                 normalize(X, mm_mu, mm_sig, X)
 
                 # Compute residuals
                 y -= bias
-                ch.addmm(input=y, mat1=X, mat2=weight, out=residual, beta=-1)
+                extract_columns(weight, weight_buf, indices)
+                extract_columns(y, y_buf, indices)
+                ch.addmm(input=y_buf[:, :num_keep], mat1=X,
+                         mat2=weight_buf[:, :num_keep],
+                         out=residual[:, :num_keep], beta=-1)
 
                 residual -= a_prev
-                ch.mm(X.T, residual, out=w_saga)
+
+                ch.mm(X.T, residual[:, :num_keep], out=weight_buf[:, :num_keep])
+                write_columns(w_saga, weight_buf, indices)
 
                 w_saga /= batch_size
                 w_saga += w_grad_avg
-                b_saga = residual.sum(0) / batch_size
+
+                ch.sum(residual[:, :num_keep], dim=0, out=bias_buf[:num_keep])
+                b_saga.index_copy_(0, indices, bias_buf[:num_keep])
+                b_saga /= batch_size
                 b_saga += b_grad_avg
 
                 # Gradient steps for weight
+                w_saga[:, ~still_opt_outer] = 0
                 weight.add_(w_saga, alpha=-lr)
                 if update_bias:
                     bias.add_(b_saga, alpha=-lr)
@@ -215,11 +246,12 @@ def train_saga(weight, bias, loader, val_loader, *,
                 if thr is not None:
                     thr.join()
 
-                def do_work(_idx):
-                    a_table.index_copy_(0, _idx, shuttle)
+                def do_work(_idx, _still_opt):
+                    a_buffer_cpu.index_copy_(1, _still_opt, shuttle[:, :num_keep])
+                    # a_table.index_copy_(0, _idx, a_buffer_cpu)
 
-                shuttle.copy_(residual, non_blocking=True)
-                thr = Thread(target=do_work, args=(idx.cpu(),))
+                shuttle[:, :num_keep].copy_(residual[:, :num_keep], non_blocking=True)
+                thr = Thread(target=do_work, args=(idx.cpu(), cpu_indices))
                 thr.start()
 
                 # Update average gradients
@@ -253,17 +285,6 @@ def train_saga(weight, bias, loader, val_loader, *,
 
             # Decrement lambdas for the ones done optimizing
             if t % early_stop_freq == early_stop_freq - 1:
-                """
-                    if done_optimizing_inner[output_ind]:
-                        cox_store['weights'].append_row({
-                            'index': output_ind,
-                            'lambda_ind': lambdas_done[output_ind],
-                            'lambda': lam[output_ind],
-                            'weight': weight[:, output_ind],
-                            'bias': bias[output_ind]
-                        })
-                """
-
                 lambdas_done += (done_opt_inner & still_opt_outer)
                 still_opt_outer[lambdas_done == num_lambdas] = False
 
@@ -287,21 +308,6 @@ def train_saga(weight, bias, loader, val_loader, *,
             total_train_losses[:] = 0.
             if ch.all(~still_opt_outer):
                 break
-            elif dynamic_resize and ch.mean(still_opt_outer.float()) < 0.9:
-                print('Resizing stuff...')
-                w_cpu[:, last_resizer] = weight[:, still_opt_outer]
-                b_cpu[:, last_resizer] = bias[still_opt_outer]
-
-                last_resizer = last_resizer[still_opt_outer]
-                a_table = a_table[:, still_opt_outer]
-                shuttle = shuttle[:, still_opt_outer]
-                w_grad_avg = w_grad_avg[:, still_opt_outer]
-                w_saga = w_saga[:, still_opt_outer]
-                b_grad_avg = b_grad_avg[still_opt_outer]
-                done_opt_inner = done_opt_inner[still_opt_outer]
-                still_opt_outer = still_opt_outer[still_opt_outer]
-                weight = weight[:, still_opt_outer]
-                bias = bias[still_opt_outer]
 
             nnz = weight.nonzero().shape[0]
             total = weight.shape[0]
@@ -310,5 +316,6 @@ def train_saga(weight, bias, loader, val_loader, *,
                   f"{lambdas_done.float().mean():.2f} lambdas done on average")
             t += 1
     except KeyboardInterrupt:
-        cox_store.close()
+        if logger is not None:
+            logger.flush()
         print('Interrupted, quitting...')
