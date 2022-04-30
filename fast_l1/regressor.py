@@ -85,7 +85,8 @@ def get_num_examples(loader):
 
 
 def eval_saga(weight, bias, loader, stats,
-              batch_size, num_inputs, num_outputs):
+              batch_size, num_inputs, num_outputs,
+              index_mapping):
     residual = ch.zeros((batch_size, num_outputs),
                         dtype=ch.float32, device=weight.device)
     total_loss = ch.zeros(num_outputs,
@@ -93,6 +94,8 @@ def eval_saga(weight, bias, loader, stats,
     X = ch.empty(batch_size, num_inputs,
                  dtype=ch.float32, device=weight.device)
     mm_mu, mm_sig = stats
+    y_buf = ch.empty(batch_size, num_outputs,
+                 dtype=ch.float32, device=weight.device)
 
     iterator = tqdm(loader)
     total_loss[:] = 0.
@@ -104,8 +107,9 @@ def eval_saga(weight, bias, loader, stats,
         normalize(X, mm_mu, mm_sig, X)
 
         # Compute residuals
+        extract_columns(y, y_buf, index_mapping)
         y -= bias
-        ch.addmm(input=y, mat1=X, mat2=weight, out=residual, beta=-1)
+        ch.addmm(input=y_buf, mat1=X, mat2=weight, out=residual, beta=-1)
 
         residual.pow_(2)
         losses = residual.sum(0)
@@ -120,6 +124,14 @@ def tensor_factory(dtype, device):
     return make_tensor
 
 
+def swap_inds(tens, inds1, inds2, dim=1):
+    if dim == 0:
+        tens[ch.cat([inds1, inds2])] = tens[ch.cat([inds2, inds1])]
+    elif dim == 1:
+        tens[:, ch.cat([inds1, inds2])] = tens[:, ch.cat([inds2, inds1])]
+    else:
+        raise ValueError("invalid dim value")
+
 def train_saga(weight, bias, loader, val_loader, *,
                lr, start_lams, lam_decay, num_lambdas,
                early_stop_freq=2, early_stop_eps=1e-5,
@@ -129,7 +141,6 @@ def train_saga(weight, bias, loader, val_loader, *,
     zeros = tensor_factory(ch.float32, weight.device)
     bool_zeros = tensor_factory(ch.bool, weight.device)
 
-    lam = start_lams.clone().to(weight.device)
     X, y, _ = next(iter(loader))
     batch_size, num_inputs, num_outputs = y.shape[0], X.shape[1], y.shape[1]
 
@@ -147,42 +158,46 @@ def train_saga(weight, bias, loader, val_loader, *,
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
 
+    # Stateful variables
+    lam = start_lams.clone().to(weight.device)
     w_grad_avg = zeros(*weight.shape)
-    w_saga = zeros(*weight.shape)
     b_grad_avg = zeros(*bias.shape)
-    b_saga = zeros(*bias.shape)
 
+    done_opt_inner = bool_zeros(num_outputs) # Stateful
+    still_opt_outer = ~bool_zeros(num_outputs) # Stateful
+    got_worse = bool_zeros(num_outputs) # Stateful
+
+    # Pre-allocated loop variables
+    w_saga = zeros(*weight.shape)
+    b_saga = zeros(*bias.shape)
     residual = zeros(batch_size, num_outputs)
 
-    # w_norm = zeros(num_outputs)
-    done_opt_inner = bool_zeros(num_outputs)
-    still_opt_outer = ~bool_zeros(num_outputs)
+    prev_w = ch.zeros_like(weight)
+    deltas = zeros(num_outputs)
     new_fin_mask = bool_zeros(num_outputs)
-    got_worse = bool_zeros(num_outputs)
 
+    # Preallocated inputs
     X = zeros(batch_size, num_inputs)
     train_stats = calc_stats(loader)
     mm_mu, mm_sig = train_stats
     t = 0
 
     # This is to keep track of early stopping
-    prev_w = ch.zeros_like(weight)
-    deltas = zeros(num_outputs)
+    # Garbage variable
     deltas_inds = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
-    last_mse = zeros(num_outputs) + ch.inf
+    last_mse = zeros(num_outputs) + ch.inf # Stateful
+    # Stateful
     lambdas_done = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
 
     # This is for logging
+    # Overriden in loop
     train_losses = zeros(num_outputs)
     total_train_losses = zeros(num_outputs)
 
     # These are buffers for fastmm
-    weight_buf = ch.zeros_like(weight)
-    bias_buf = ch.zeros_like(bias)
-    lam_buf = ch.zeros_like(lam)
     y_buf = zeros(batch_size, num_outputs)
 
-    a_prev = zeros(batch_size, num_outputs)    
+    a_prev = zeros(batch_size, num_outputs)
     index_mapping = ch.arange(num_outputs).cuda()
     num_keep = num_outputs
     try:
@@ -191,8 +206,6 @@ def train_saga(weight, bias, loader, val_loader, *,
             thr = None
             prev_w[:] = weight
             # Try rearranging weight vector here
-            extract_columns(weight, weight_buf, index_mapping[:num_keep])
-            lam_buf[:num_keep] = lam[index_mapping[:num_keep]]
             for bool_X, y, idx in iterator:
                 a_prev[:, :num_keep].copy_(a_table[idx, :num_keep], non_blocking=True)
 
@@ -200,33 +213,27 @@ def train_saga(weight, bias, loader, val_loader, *,
                 normalize(X, mm_mu, mm_sig, X)
 
                 # Compute residuals
-                y -= bias
                 extract_columns(y, y_buf, index_mapping[:num_keep])
+                y[:, :num_keep] -= bias[:num_keep]
                 ch.addmm(input=y_buf[:, :num_keep], mat1=X,
-                         mat2=weight_buf[:, :num_keep],
+                         mat2=weight[:, :num_keep],
                          out=residual[:, :num_keep], beta=-1)
 
                 residual -= a_prev
 
-                # ch.mm(X.T, residual[:, :num_keep], out=weight_buf[:, :num_keep])
-                # write_columns(w_saga, weight_buf, index_mapping[:num_keep])
                 ch.mm(X.T, residual[:, :num_keep], out=w_saga[:, :num_keep])
 
                 w_saga /= batch_size
                 w_saga += w_grad_avg
 
-                ch.sum(residual[:, :num_keep], dim=0, out=bias_buf[:num_keep])
-                b_saga.index_copy_(0, index_mapping[:num_keep], bias_buf[:num_keep])
+                ch.sum(residual[:, :num_keep], dim=0, out=b_saga[:num_keep])
                 b_saga /= batch_size
                 b_saga += b_grad_avg
 
                 # Gradient steps for weight
-                # w_saga[:, ~still_opt_outer] = 0
-                # weight.add_(w_saga, alpha=-lr)
-                # weight.index_add_(1, index_mapping[:num_keep], w_saga[:num_keep], alpha=-lr)
-                weight_buf[:, :num_keep].add_(w_saga[:, :num_keep], alpha=-lr)
+                weight[:, :num_keep].add_(w_saga[:, :num_keep], alpha=-lr)
                 if update_bias:
-                    bias.add_(b_saga, alpha=-lr)
+                    bias[:num_keep].add_(b_saga[:num_keep], alpha=-lr)
 
                 # update table and averages
                 residual += a_prev
@@ -236,14 +243,11 @@ def train_saga(weight, bias, loader, val_loader, *,
                 if thr is not None:
                     thr.join()
 
-                def do_work(_idx, _still_opt):
-                    # a_buffer_cpu.index_copy_(1, _still_opt, shuttle[:, :num_keep])
-                    # a_table.index_copy_(0, _idx, a_buffer_cpu)
+                def do_work(_idx):
                     a_table[:, :num_keep].index_copy_(0, _idx, shuttle[:, :num_keep])
 
                 shuttle[:, :num_keep].copy_(residual[:, :num_keep], non_blocking=True)
-                # thr = Thread(target=do_work, args=(idx.cpu(), cpu_indices))
-                thr = Thread(target=do_work, args=(idx.cpu(), None))
+                thr = Thread(target=do_work, args=(idx.cpu(),))
                 thr.start()
 
                 # Update average gradients
@@ -251,15 +255,11 @@ def train_saga(weight, bias, loader, val_loader, *,
                 avg_grad_update(b_grad_avg, b_saga, batch_size, n_ex)
 
                 # Thresholding operation
-                # fast_threshold(weight, lr * lam)
-                fast_threshold(weight_buf, lr * lam_buf)
+                fast_threshold(weight, lr * lam)
 
                 residual.pow_(2)
                 ch.sum(residual, dim=0, out=train_losses)
                 total_train_losses += train_losses
-
-            write_columns(weight, weight_buf, index_mapping[:num_keep])
-            lam.index_copy_(0, index_mapping[:num_keep], lam_buf[:num_keep])
 
             # https://glmnet.stanford.edu/articles/glmnet.html#appendix-0-convergence-criteria-1
             prev_w -= weight
@@ -287,16 +287,20 @@ def train_saga(weight, bias, loader, val_loader, *,
                 # New value of the MSE
                 new_mse = eval_saga(weight, bias, val_loader,
                                     train_stats, batch_size,
-                                    num_inputs, num_outputs)
+                                    num_inputs, num_outputs,
+                                    index_mapping[:num_keep])
 
                 # Of the indices done optimizing, see if val loss got worse
+                import ipdb; ipdb.set_trace()
                 got_worse[:] = (new_mse > last_mse) & done_opt_inner
 
                 # Wherever it got worse, stop optimizing and decrement lambda
                 lam[got_worse & still_opt_outer] /= lam_decay
                 new_fin_mask |= got_worse
+                new_fin_mask &= still_opt_outer
                 still_opt_outer[new_fin_mask] = False
 
+                # Where (in the original indices) we are newly done
                 new_fin_inds = ch.where(new_fin_mask)[0].cpu()
                 inds_to_swap = ch.arange(num_keep - len(new_fin_inds), num_keep)
 
@@ -306,12 +310,14 @@ def train_saga(weight, bias, loader, val_loader, *,
                     import ipdb; ipdb.set_trace()
                     pass
 
-                a_table[:, ch.cat([inds_to_swap, new_fin_inds])] = \
-                    a_table[:, ch.cat([new_fin_inds, inds_to_swap])]
-                index_mapping[ch.cat([inds_to_swap, new_fin_inds])] = \
-                    index_mapping[ch.cat([new_fin_inds, inds_to_swap])]
-                w_grad_avg[:, ch.cat([inds_to_swap, new_fin_inds])] = \
-                    w_grad_avg[:, ch.cat([new_fin_inds, inds_to_swap])]
+                for tens in [a_table, w_grad_avg, weight]:
+                    swap_inds(tens, inds_to_swap, new_fin_inds)
+
+                for tens in [bias, lam, b_grad_avg,
+                             still_opt_outer, index_mapping,
+                             lambdas_done, last_mse]:
+                    swap_inds(tens, inds_to_swap, new_fin_inds, 0)
+
                 assert ch.all(index_mapping.sort().values.cpu() == ch.arange(num_outputs))
                 num_keep = still_opt_outer.sum().cpu().item()
 
@@ -323,7 +329,6 @@ def train_saga(weight, bias, loader, val_loader, *,
             total_train_losses[:] = 0.
             if ch.all(~still_opt_outer):
                 break
-                
 
             nnz = weight.nonzero().shape[0]
             total = weight.shape[0]
