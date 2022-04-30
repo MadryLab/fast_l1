@@ -146,8 +146,6 @@ def train_saga(weight, bias, loader, val_loader, *,
 
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
-    a_buffer_cpu = zeros(batch_size, num_outputs).cpu().pin_memory()
-    a_buffer_gpu = zeros(batch_size, num_outputs)
 
     w_grad_avg = zeros(*weight.shape)
     w_saga = zeros(*weight.shape)
@@ -181,18 +179,10 @@ def train_saga(weight, bias, loader, val_loader, *,
     # These are buffers for fastmm
     weight_buf = ch.zeros_like(weight)
     bias_buf = ch.zeros_like(bias)
+    lam_buf = ch.zeros_like(lam)
     y_buf = zeros(batch_size, num_outputs)
 
-    a_prev = zeros(batch_size, num_outputs)
-
-    # REMOVE THIS
-    num_keep = num_outputs
-    # still_opt_outer[:] = False
-    # real_inds = ch.randperm(10000)[:10000]
-    # still_opt_outer[real_inds] = True
-    # indices = ch.where(still_opt_outer)[0].cpu()
-    # num_keep = 1000
-    
+    a_prev = zeros(batch_size, num_outputs)    
     index_mapping = ch.arange(num_outputs).cuda()
     num_keep = num_outputs
     try:
@@ -200,25 +190,17 @@ def train_saga(weight, bias, loader, val_loader, *,
             iterator = tqdm(loader)
             thr = None
             prev_w[:] = weight
+            # Try rearranging weight vector here
+            extract_columns(weight, weight_buf, index_mapping[:num_keep])
+            lam_buf[:num_keep] = lam[index_mapping[:num_keep]]
             for bool_X, y, idx in iterator:
-                # indices = ch.where(still_opt_outer)[0]
-                # cpu_idx = idx.cpu()
-                # cpu_indices = indices.cpu()
-                # num_keep = still_opt_outer.sum() #len(indices)
-
                 a_prev[:, :num_keep].copy_(a_table[idx, :num_keep], non_blocking=True)
-                # Previous residuals
-                # a_buffer_gpu.copy_(a_table[idx], non_blocking=True)
-                # a_prev[:, :num_keep].copy_(a_buffer_gpu[:, still_opt_outer],
-                                        #    non_blocking=True)
-                # a_prev[:, :num_keep].copy_(a_table[cpu_idx][:, cpu_indices], non_blocking=True)
 
                 X.copy_(bool_X)
                 normalize(X, mm_mu, mm_sig, X)
 
                 # Compute residuals
                 y -= bias
-                extract_columns(weight, weight_buf, index_mapping[:num_keep])
                 extract_columns(y, y_buf, index_mapping[:num_keep])
                 ch.addmm(input=y_buf[:, :num_keep], mat1=X,
                          mat2=weight_buf[:, :num_keep],
@@ -226,9 +208,9 @@ def train_saga(weight, bias, loader, val_loader, *,
 
                 residual -= a_prev
 
-                ch.mm(X.T, residual[:, :num_keep], out=weight_buf[:, :num_keep])
-                # write_columns(w_saga, weight_buf, indices)
-                write_columns(w_saga, weight_buf, index_mapping[:num_keep])
+                # ch.mm(X.T, residual[:, :num_keep], out=weight_buf[:, :num_keep])
+                # write_columns(w_saga, weight_buf, index_mapping[:num_keep])
+                ch.mm(X.T, residual[:, :num_keep], out=w_saga[:, :num_keep])
 
                 w_saga /= batch_size
                 w_saga += w_grad_avg
@@ -240,7 +222,9 @@ def train_saga(weight, bias, loader, val_loader, *,
 
                 # Gradient steps for weight
                 # w_saga[:, ~still_opt_outer] = 0
-                weight.add_(w_saga, alpha=-lr)
+                # weight.add_(w_saga, alpha=-lr)
+                # weight.index_add_(1, index_mapping[:num_keep], w_saga[:num_keep], alpha=-lr)
+                weight_buf[:, :num_keep].add_(w_saga[:, :num_keep], alpha=-lr)
                 if update_bias:
                     bias.add_(b_saga, alpha=-lr)
 
@@ -267,11 +251,15 @@ def train_saga(weight, bias, loader, val_loader, *,
                 avg_grad_update(b_grad_avg, b_saga, batch_size, n_ex)
 
                 # Thresholding operation
-                fast_threshold(weight, lr * lam)
+                # fast_threshold(weight, lr * lam)
+                fast_threshold(weight_buf, lr * lam_buf)
 
                 residual.pow_(2)
                 ch.sum(residual, dim=0, out=train_losses)
                 total_train_losses += train_losses
+
+            write_columns(weight, weight_buf, index_mapping[:num_keep])
+            lam.index_copy_(0, index_mapping[:num_keep], lam_buf[:num_keep])
 
             # https://glmnet.stanford.edu/articles/glmnet.html#appendix-0-convergence-criteria-1
             prev_w -= weight
@@ -312,11 +300,20 @@ def train_saga(weight, bias, loader, val_loader, *,
                 new_fin_inds = ch.where(new_fin_mask)[0].cpu()
                 inds_to_swap = ch.arange(num_keep - len(new_fin_inds), num_keep)
 
+                inds_to_swap = inds_to_swap[still_opt_outer[inds_to_swap]]
+                new_fin_inds = new_fin_inds[new_fin_inds < num_keep - len(new_fin_inds)]
+                if len(inds_to_swap) != len(new_fin_inds):
+                    import ipdb; ipdb.set_trace()
+                    pass
+
                 a_table[:, ch.cat([inds_to_swap, new_fin_inds])] = \
                     a_table[:, ch.cat([new_fin_inds, inds_to_swap])]
                 index_mapping[ch.cat([inds_to_swap, new_fin_inds])] = \
                     index_mapping[ch.cat([new_fin_inds, inds_to_swap])]
-                num_keep -= len(new_fin_inds)
+                w_grad_avg[:, ch.cat([inds_to_swap, new_fin_inds])] = \
+                    w_grad_avg[:, ch.cat([new_fin_inds, inds_to_swap])]
+                assert ch.all(index_mapping.sort().values.cpu() == ch.arange(num_outputs))
+                num_keep = still_opt_outer.sum().cpu().item()
 
                 # Wherever we are done, update the val mse and lambda
                 last_mse[done_opt_inner] = new_mse[done_opt_inner]
