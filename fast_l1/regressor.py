@@ -7,7 +7,6 @@ from tqdm import tqdm
 from cupy import ElementwiseKernel
 
 from fast_l1.logger import Logger
-from fast_l1.fastmm import extract_columns, selective_matmul, selective_addmm, write_columns
 
 kernel = ElementwiseKernel(
     'float32 data, float32 lamb',
@@ -81,6 +80,7 @@ def get_num_examples(loader):
         n_ex += float(bool_X.shape[0])
         largest_ind = max(largest_ind, idx.max().cpu().item())
 
+    print('Largest index', largest_ind)
     return largest_ind, n_ex
 
 
@@ -95,11 +95,12 @@ def eval_saga(weight, bias, loader, stats,
                  dtype=ch.float32, device=weight.device)
     mm_mu, mm_sig = stats
     y_buf = ch.empty(batch_size, num_outputs,
-                 dtype=ch.float32, device=weight.device)
+                     dtype=ch.float32, device=weight.device)
 
     iterator = tqdm(loader)
     total_loss[:] = 0.
     n_ex = 0
+
     for bool_X, y, idx in iterator:
         # Previous residuals
         n_ex += bool_X.shape[0]
@@ -107,8 +108,8 @@ def eval_saga(weight, bias, loader, stats,
         normalize(X, mm_mu, mm_sig, X)
 
         # Compute residuals
-        extract_columns(y, y_buf, index_mapping)
-        y -= bias
+        y_buf[:] = y[:, index_mapping]
+        y_buf -= bias
         ch.addmm(input=y_buf, mat1=X, mat2=weight, out=residual, beta=-1)
 
         residual.pow_(2)
@@ -132,6 +133,7 @@ def swap_inds(tens, inds1, inds2, dim=1):
     else:
         raise ValueError("invalid dim value")
 
+
 def train_saga(weight, bias, loader, val_loader, *,
                lr, start_lams, lam_decay, num_lambdas,
                early_stop_freq=2, early_stop_eps=1e-5,
@@ -147,13 +149,14 @@ def train_saga(weight, bias, loader, val_loader, *,
     logger = None
     if logdir is not None:
         logger = Logger(logdir, fields={
-            'train_mse': (np.float32, num_outputs),
-            'val_mse': (np.float32, num_outputs),
-            'lambda': (np.float32, num_outputs),
-            'weight_norm': (np.float32, num_outputs),
-            'done_optimizing_inner': (np.bool_, num_outputs),
-            'still_optimizing_outer': (np.bool_, num_outputs)
-        }, cnk_size=10_000)
+            'train_mse': np.float32,
+            'val_mse': np.float32,
+            'lambda': np.float32,
+            'last_lambda': np.bool_,
+            'weight_norm': np.float32,
+            'done_optimizing_inner': np.bool_,
+            'still_optimizing_outer': np.bool_
+        }, field_size=num_outputs, cnk_size=10_000)
 
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
@@ -163,9 +166,13 @@ def train_saga(weight, bias, loader, val_loader, *,
     w_grad_avg = zeros(*weight.shape)
     b_grad_avg = zeros(*bias.shape)
 
-    done_opt_inner = bool_zeros(num_outputs) # Stateful
-    still_opt_outer = ~bool_zeros(num_outputs) # Stateful
-    got_worse = bool_zeros(num_outputs) # Stateful
+    done_opt_inner = bool_zeros(num_outputs)
+    still_opt_outer = ~bool_zeros(num_outputs)
+    last_lambda = bool_zeros(num_outputs)
+    got_worse = bool_zeros(num_outputs)
+
+    last_mse = zeros(num_outputs) + ch.inf
+    lambdas_done = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
 
     # Pre-allocated loop variables
     w_saga = zeros(*weight.shape)
@@ -185,12 +192,8 @@ def train_saga(weight, bias, loader, val_loader, *,
     # This is to keep track of early stopping
     # Garbage variable
     deltas_inds = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
-    last_mse = zeros(num_outputs) + ch.inf # Stateful
-    # Stateful
-    lambdas_done = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
 
     # This is for logging
-    # Overriden in loop
     train_losses = zeros(num_outputs)
     total_train_losses = zeros(num_outputs)
 
@@ -207,14 +210,16 @@ def train_saga(weight, bias, loader, val_loader, *,
             prev_w[:] = weight
             # Try rearranging weight vector here
             for bool_X, y, idx in iterator:
-                a_prev[:, :num_keep].copy_(a_table[idx, :num_keep], non_blocking=True)
+                a_prev[:, :num_keep].copy_(a_table[idx, :num_keep],
+                                           non_blocking=True)
 
                 X.copy_(bool_X)
                 normalize(X, mm_mu, mm_sig, X)
 
                 # Compute residuals
-                extract_columns(y, y_buf, index_mapping[:num_keep])
-                y[:, :num_keep] -= bias[:num_keep]
+                y_buf[:, :num_keep] = y[:, index_mapping[:num_keep]]
+                y_buf[:, :num_keep] -= bias[:num_keep]
+
                 ch.addmm(input=y_buf[:, :num_keep], mat1=X,
                          mat2=weight[:, :num_keep],
                          out=residual[:, :num_keep], beta=-1)
@@ -244,22 +249,27 @@ def train_saga(weight, bias, loader, val_loader, *,
                     thr.join()
 
                 def do_work(_idx):
-                    a_table[:, :num_keep].index_copy_(0, _idx, shuttle[:, :num_keep])
+                    a_table[:, :num_keep].index_copy_(0, _idx,
+                                                      shuttle[:, :num_keep])
 
-                shuttle[:, :num_keep].copy_(residual[:, :num_keep], non_blocking=True)
+                shuttle[:, :num_keep].copy_(residual[:, :num_keep],
+                                            non_blocking=True)
                 thr = Thread(target=do_work, args=(idx.cpu(),))
                 thr.start()
 
                 # Update average gradients
-                avg_grad_update(w_grad_avg, w_saga, batch_size, n_ex)
-                avg_grad_update(b_grad_avg, b_saga, batch_size, n_ex)
+                avg_grad_update(w_grad_avg[:, :num_keep], w_saga[:, :num_keep],
+                                batch_size, n_ex)
+                avg_grad_update(b_grad_avg[:num_keep], b_saga[:num_keep],
+                                batch_size, n_ex)
 
                 # Thresholding operation
-                fast_threshold(weight, lr * lam)
+                fast_threshold(weight[:, :num_keep], lr * lam[:num_keep])
 
-                residual.pow_(2)
-                ch.sum(residual, dim=0, out=train_losses)
-                total_train_losses += train_losses
+                residual[:, :num_keep].pow_(2)
+                ch.sum(residual[:, :num_keep], dim=0,
+                       out=train_losses[:num_keep])
+                total_train_losses[:num_keep] += train_losses[:num_keep]
 
             # https://glmnet.stanford.edu/articles/glmnet.html#appendix-0-convergence-criteria-1
             prev_w -= weight
@@ -272,43 +282,57 @@ def train_saga(weight, bias, loader, val_loader, *,
                 'train_mse': total_train_losses / n_ex,
                 'val_mse': last_mse,
                 'lambda': lam,
+                'last_lambda': last_lambda,
                 'done_optimizing_inner': done_opt_inner,
                 'still_optimizing_outer': still_opt_outer
             }
             if logger is not None:
                 for name, value in data_to_log.items():
                     logger.log(name, value.cpu().numpy())
+                print(index_mapping)
+                logger.log_index_mapping(index_mapping.cpu().numpy())
 
             # Decrement lambdas for the ones done optimizing
             if t % early_stop_freq == early_stop_freq - 1:
                 lambdas_done += (done_opt_inner & still_opt_outer)
                 ch.eq(lambdas_done, num_lambdas, out=new_fin_mask)
+                # last_lambda &= done_opt_inner
+                new_fin_mask |= (last_lambda & done_opt_inner)
+                last_lambda[new_fin_mask] = False
 
                 # New value of the MSE
-                new_mse = eval_saga(weight, bias, val_loader,
-                                    train_stats, batch_size,
-                                    num_inputs, num_outputs,
-                                    index_mapping[:num_keep])
+                new_mse = None
+                if val_loader:
+                    new_mse = eval_saga(weight, bias, val_loader,
+                                        train_stats, batch_size,
+                                        num_inputs, num_outputs,
+                                        index_mapping)
+                    print(new_mse.mean(), new_mse.max())
 
-                # Of the indices done optimizing, see if val loss got worse
-                import ipdb; ipdb.set_trace()
-                got_worse[:] = (new_mse > last_mse) & done_opt_inner
+                    # Of the indices done optimizing, see if val loss got worse
+                    ch.greater_equal(new_mse, last_mse, out=got_worse)
+                else:
+                    got_worse[:] = True
+
+                got_worse &= done_opt_inner
+                got_worse &= still_opt_outer
+                # got_worse[:] = (new_mse >= last_mse) & done_opt_inner
 
                 # Wherever it got worse, stop optimizing and decrement lambda
-                lam[got_worse & still_opt_outer] /= lam_decay
-                new_fin_mask |= got_worse
+                # lam[got_worse & still_opt_outer] /= lam_decay
+                lam[got_worse & ~last_lambda] /= lam_decay
+                last_lambda[got_worse] = True
+                # new_fin_mask |= got_worse
                 new_fin_mask &= still_opt_outer
                 still_opt_outer[new_fin_mask] = False
 
                 # Where (in the original indices) we are newly done
                 new_fin_inds = ch.where(new_fin_mask)[0].cpu()
-                inds_to_swap = ch.arange(num_keep - len(new_fin_inds), num_keep)
+                new_done = len(new_fin_inds)
+                inds_to_swap = ch.arange(num_keep - new_done, num_keep)
 
                 inds_to_swap = inds_to_swap[still_opt_outer[inds_to_swap]]
-                new_fin_inds = new_fin_inds[new_fin_inds < num_keep - len(new_fin_inds)]
-                if len(inds_to_swap) != len(new_fin_inds):
-                    import ipdb; ipdb.set_trace()
-                    pass
+                new_fin_inds = new_fin_inds[new_fin_inds < num_keep - new_done]
 
                 for tens in [a_table, w_grad_avg, weight]:
                     swap_inds(tens, inds_to_swap, new_fin_inds)
@@ -318,12 +342,16 @@ def train_saga(weight, bias, loader, val_loader, *,
                              lambdas_done, last_mse]:
                     swap_inds(tens, inds_to_swap, new_fin_inds, 0)
 
-                assert ch.all(index_mapping.sort().values.cpu() == ch.arange(num_outputs))
                 num_keep = still_opt_outer.sum().cpu().item()
 
                 # Wherever we are done, update the val mse and lambda
-                last_mse[done_opt_inner] = new_mse[done_opt_inner]
-                lam[done_opt_inner & still_opt_outer] *= lam_decay
+                if new_mse is not None:
+                    last_mse[done_opt_inner] = new_mse[done_opt_inner]
+                else:
+                    last_mse[done_opt_inner] = 0.
+                done_opt_inner &= still_opt_outer
+                done_opt_inner &= ~last_lambda
+                lam[done_opt_inner] *= lam_decay
                 done_opt_inner[:] = False
 
             total_train_losses[:] = 0.
@@ -332,12 +360,22 @@ def train_saga(weight, bias, loader, val_loader, *,
 
             nnz = weight.nonzero().shape[0]
             total = weight.shape[0]
-            print(f"epoch: {t} | delta: {deltas.mean()} | "
-                  f"weight nnz {nnz}/{total} ({nnz/(weight.shape[1] * total):.4f}) | "
-                  f"{lambdas_done.float().mean():.2f} lambdas done on average | "
-                  f"{num_keep} examples left")
+            avg_lambdas_done = lambdas_done.float().mean()
+            sparsity = nnz/(weight.shape[1] * total)
+            print(f"epoch: {t} | "
+                  f"delta: {deltas[still_opt_outer].mean()} | "
+                  f"weight nnz {nnz}/{total} ({sparsity:.4f}) | "
+                  f"{avg_lambdas_done:.2f} lambdas done on average | "
+                  f"{num_keep} examples left | "
+                  f"{last_lambda.sum()} last lambdas")
             t += 1
     except KeyboardInterrupt:
         if logger is not None:
             logger.flush()
         print('Interrupted, quitting...')
+
+    index_unmapping = ch.argsort(index_mapping)
+    weight[:] = weight[:, index_unmapping]
+    bias[:] = bias[index_unmapping]
+    lam[:] = lam[index_unmapping]
+    return lam

@@ -1,13 +1,15 @@
 data:
-  data_path: '/mnt/nfs/home/aiilyas/store/cifar_datamodels/models_1/regression_data.beton'
-  num_train: 90000 
-  num_val: 10000
+  # data_path:
+  # '/mnt/nfs/home/aiilyas/store/cifar_datamodels/models_1/regression_data.beton'
+  data_path: '/mnt/nfs/home/aiilyas/subpops_betons/train_margins_50.beton'
+  num_train: 250000 
+  num_val: 50000
 cfg:
   k: 100
-  out_dir: '/tmp'
-  batch_size: 1000
-  lr: 1e-2
+  out_dir: '/mnt/nfs/home/aiilyas/slurm/scratch/datamodels_tests/train'
+  batch_size: 5000
+  lr: 5e-2
   true_random: true
 early_stopping:
-  check_every: 5
-  eps: 1e-12
+  check_every: 3
+  eps: 1e-11
