@@ -1,7 +1,6 @@
 import numpy as np
 import os
 from typing import Optional, Sequence
-import numpy as np
 from torch.utils.data import Dataset
 from ffcv.writer import DatasetWriter
 from ffcv.fields import NDArrayField, IntField
@@ -18,26 +17,29 @@ Section('cfg', 'arguments to give the writer').params(
     y_name=Param(str, 'What portion of the data to write', required=True)
 )
 
+
 class RegressionDataset(Dataset):
-    def __init__(self, *, masks_path: str, y_path: str, 
-                subset: Optional[Sequence[int]]=None):
+    def __init__(self, *, masks_path: str, y_path: str,
+                 subset: Optional[Sequence[int]] = None):
         super().__init__()
         self.masks_fp = np.lib.format.open_memmap(masks_path, mode='r')
         self.x_dtype = self.masks_fp.dtype
-        self.y_vals_fp = np.lib.format.open_memmap(y_path, mode='r') 
+        self.y_vals_fp = np.lib.format.open_memmap(y_path, mode='r')
         self.y_dtype = self.y_vals_fp.dtype
-        self.subset = range(self.masks_fp.shape[0]) if subset is None else subset
-    
+        self.subset = subset or range(self.masks_fp.shape[0])
+
     def __getitem__(self, idx):
         inds = self.subset[idx]
-        x_val, y_val = self.masks_fp[inds], self.y_vals_fp[inds].astype('float32')
+        x_val = self.masks_fp[inds]
+        y_val = self.y_vals_fp[inds].astype('float32')
         return x_val, y_val, inds
-    
+
     def shape(self):
         return self.masks_fp.shape[1], self.y_vals_fp.shape[1]
-    
+
     def __len__(self):
         return len(self.subset)
+
 
 @param('cfg.data_dir')
 @param('cfg.out_path')
@@ -45,7 +47,7 @@ class RegressionDataset(Dataset):
 @param('cfg.y_name')
 def write_dataset(data_dir: str, out_path: str, x_name: str, y_name: str):
     ds = RegressionDataset(
-            masks_path=os.path.join(data_dir, f'{x_name}.npy'), 
+            masks_path=os.path.join(data_dir, f'{x_name}.npy'),
             y_path=os.path.join(data_dir, f'{y_name}.npy'))
 
     x_dim, y_dim = ds.shape()
@@ -56,6 +58,7 @@ def write_dataset(data_dir: str, out_path: str, x_name: str, y_name: str):
     })
 
     writer.from_indexed_dataset(ds)
+
 
 if __name__ == '__main__':
     config = get_current_config()

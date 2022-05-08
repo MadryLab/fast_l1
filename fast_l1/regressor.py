@@ -289,7 +289,6 @@ def train_saga(weight, bias, loader, val_loader, *,
             if logger is not None:
                 for name, value in data_to_log.items():
                     logger.log(name, value.cpu().numpy())
-                print(index_mapping)
                 logger.log_index_mapping(index_mapping.cpu().numpy())
 
             # Decrement lambdas for the ones done optimizing
@@ -307,7 +306,6 @@ def train_saga(weight, bias, loader, val_loader, *,
                                         train_stats, batch_size,
                                         num_inputs, num_outputs,
                                         index_mapping)
-                    print(new_mse.mean(), new_mse.max())
 
                     # Of the indices done optimizing, see if val loss got worse
                     ch.greater_equal(new_mse, last_mse, out=got_worse)
@@ -322,7 +320,6 @@ def train_saga(weight, bias, loader, val_loader, *,
                 # lam[got_worse & still_opt_outer] /= lam_decay
                 lam[got_worse & ~last_lambda] /= lam_decay
                 last_lambda[got_worse] = True
-                # new_fin_mask |= got_worse
                 new_fin_mask &= still_opt_outer
                 still_opt_outer[new_fin_mask] = False
 

@@ -66,14 +66,18 @@ def agg(dat):
     i, mmap_name, reindexer_name, index, agg_fn = dat
     mmap = open_memmap(mmap_name, mode='r')
     reindexer = open_memmap(reindexer_name, mode='r')
-    if not np.all(np.sort(reindexer[i]) == np.arange(reindexer[i].shape[0])):
+    unindexer = np.argsort(reindexer[i])
+    if not np.all(reindexer[i][unindexer] == np.arange(reindexer[i].shape[0])):
         return None
+    new_row = mmap[i, unindexer]
     if index is not None:
-        return mmap[i, np.where(reindexer[i] == index)[0][0]]
-    row = mmap[i, reindexer[i]]
+        return new_row[index]
+        # np.where(reindexer[i] == index)[0][0]]
+        # return mmap[i, np.where(reindexer[i] == index)[0][0]]
+    # row = mmap[i, reindexer[i]]
     if agg_fn:
-        return agg_fn(row)
-    return row
+        return agg_fn(new_row)
+    return new_row
 
 
 class Reader:
