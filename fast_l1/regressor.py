@@ -1,10 +1,10 @@
 from threading import Thread
+from typing import Optional
 
 import numpy as np
 import torch as ch
 from tqdm import tqdm
 from cupy import ElementwiseKernel
-from cox.store import Store, PICKLE
 
 from fast_l1.logger import Logger
 
@@ -80,11 +80,13 @@ def get_num_examples(loader):
         n_ex += float(bool_X.shape[0])
         largest_ind = max(largest_ind, idx.max().cpu().item())
 
+    print('Largest index', largest_ind)
     return largest_ind, n_ex
 
 
 def eval_saga(weight, bias, loader, stats,
-              batch_size, num_inputs, num_outputs):
+              batch_size, num_inputs, num_outputs,
+              index_mapping):
     residual = ch.zeros((batch_size, num_outputs),
                         dtype=ch.float32, device=weight.device)
     total_loss = ch.zeros(num_outputs,
@@ -92,10 +94,13 @@ def eval_saga(weight, bias, loader, stats,
     X = ch.empty(batch_size, num_inputs,
                  dtype=ch.float32, device=weight.device)
     mm_mu, mm_sig = stats
+    y_buf = ch.empty(batch_size, num_outputs,
+                     dtype=ch.float32, device=weight.device)
 
     iterator = tqdm(loader)
     total_loss[:] = 0.
     n_ex = 0
+
     for bool_X, y, idx in iterator:
         # Previous residuals
         n_ex += bool_X.shape[0]
@@ -103,8 +108,9 @@ def eval_saga(weight, bias, loader, stats,
         normalize(X, mm_mu, mm_sig, X)
 
         # Compute residuals
-        y -= bias
-        ch.addmm(input=y, mat1=X, mat2=weight, out=residual, beta=-1)
+        y_buf[:] = y[:, index_mapping]
+        y_buf -= bias
+        ch.addmm(input=y_buf, mat1=X, mat2=weight, out=residual, beta=-1)
 
         residual.pow_(2)
         losses = residual.sum(0)
@@ -119,87 +125,120 @@ def tensor_factory(dtype, device):
     return make_tensor
 
 
+def swap_inds(tens, inds1, inds2, dim=1):
+    if dim == 0:
+        tens[ch.cat([inds1, inds2])] = tens[ch.cat([inds2, inds1])]
+    elif dim == 1:
+        tens[:, ch.cat([inds1, inds2])] = tens[:, ch.cat([inds2, inds1])]
+    else:
+        raise ValueError("invalid dim value")
+
+
 def train_saga(weight, bias, loader, val_loader, *,
                lr, start_lams, lam_decay, num_lambdas,
                early_stop_freq=2, early_stop_eps=1e-5,
-               cox_store: Store = None,
-               logdir: str = None,
+               logdir: Optional[str] = None,
                update_bias=True):
     largest_ind, n_ex = get_num_examples(loader)
     zeros = tensor_factory(ch.float32, weight.device)
     bool_zeros = tensor_factory(ch.bool, weight.device)
 
-    lam = start_lams.clone().to(weight.device)
     X, y, _ = next(iter(loader))
     batch_size, num_inputs, num_outputs = y.shape[0], X.shape[1], y.shape[1]
 
     logger = None
     if logdir is not None:
         logger = Logger(logdir, fields={
-            'train_mse': (np.float32, num_outputs),
-            'val_mse': (np.float32, num_outputs),
-            'lambda': (np.float32, num_outputs),
-            'weight_norm': (np.float32, num_outputs),
-            'done_optimizing_inner': (np.bool_, num_outputs),
-            'done_optimizing_outer': (np.bool_, num_outputs)
-        }, cnk_size=100_000)
+            'train_mse': np.float32,
+            'val_mse': np.float32,
+            'lambda': np.float32,
+            'last_lambda': np.bool_,
+            'weight_norm': np.float32,
+            'done_optimizing_inner': np.bool_,
+            'still_optimizing_outer': np.bool_
+        }, field_size=num_outputs, cnk_size=10_000)
 
     a_table = zeros(largest_ind + batch_size, num_outputs).cpu().pin_memory()
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
 
+    # Stateful variables
+    lam = start_lams.clone().to(weight.device)
     w_grad_avg = zeros(*weight.shape)
-    w_saga = zeros(*weight.shape)
     b_grad_avg = zeros(*bias.shape)
 
-    residual = zeros(batch_size, num_outputs)
-
-    # w_norm = zeros(num_outputs)
-    done_optimizing_inner = bool_zeros(num_outputs)
-    done_optimizing_outer = bool_zeros(num_outputs)
+    done_opt_inner = bool_zeros(num_outputs)
+    still_opt_outer = ~bool_zeros(num_outputs)
+    last_lambda = bool_zeros(num_outputs)
     got_worse = bool_zeros(num_outputs)
 
+    last_mse = zeros(num_outputs) + ch.inf
+    lambdas_done = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
+
+    # Pre-allocated loop variables
+    w_saga = zeros(*weight.shape)
+    b_saga = zeros(*bias.shape)
+    residual = zeros(batch_size, num_outputs)
+
+    prev_w = ch.zeros_like(weight)
+    deltas = zeros(num_outputs)
+    new_fin_mask = bool_zeros(num_outputs)
+
+    # Preallocated inputs
     X = zeros(batch_size, num_inputs)
     train_stats = calc_stats(loader)
     mm_mu, mm_sig = train_stats
     t = 0
 
     # This is to keep track of early stopping
-    prev_w = ch.zeros_like(weight)
-    deltas = zeros(num_outputs)
+    # Garbage variable
     deltas_inds = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
-    last_mse = zeros(num_outputs) + ch.inf
-    lambdas_done = ch.zeros(num_outputs, dtype=ch.long, device=weight.device)
 
     # This is for logging
     train_losses = zeros(num_outputs)
     total_train_losses = zeros(num_outputs)
+
+    # These are buffers for fastmm
+    y_buf = zeros(batch_size, num_outputs)
+
+    a_prev = zeros(batch_size, num_outputs)
+    index_mapping = ch.arange(num_outputs).cuda()
+    num_keep = num_outputs
     try:
         while True:
             iterator = tqdm(loader)
             thr = None
             prev_w[:] = weight
+            # Try rearranging weight vector here
             for bool_X, y, idx in iterator:
-                # Previous residuals
-                a_prev = a_table[idx].cuda(non_blocking=True)
+                a_prev[:, :num_keep].copy_(a_table[idx, :num_keep],
+                                           non_blocking=True)
+
                 X.copy_(bool_X)
                 normalize(X, mm_mu, mm_sig, X)
 
                 # Compute residuals
-                y -= bias
-                ch.addmm(input=y, mat1=X, mat2=weight, out=residual, beta=-1)
+                y_buf[:, :num_keep] = y[:, index_mapping[:num_keep]]
+                y_buf[:, :num_keep] -= bias[:num_keep]
+
+                ch.addmm(input=y_buf[:, :num_keep], mat1=X,
+                         mat2=weight[:, :num_keep],
+                         out=residual[:, :num_keep], beta=-1)
 
                 residual -= a_prev
-                ch.mm(X.T, residual, out=w_saga)
+
+                ch.mm(X.T, residual[:, :num_keep], out=w_saga[:, :num_keep])
 
                 w_saga /= batch_size
                 w_saga += w_grad_avg
-                b_saga = residual.sum(0) / batch_size
+
+                ch.sum(residual[:, :num_keep], dim=0, out=b_saga[:num_keep])
+                b_saga /= batch_size
                 b_saga += b_grad_avg
 
                 # Gradient steps for weight
-                weight.add_(w_saga, alpha=-lr)
+                weight[:, :num_keep].add_(w_saga[:, :num_keep], alpha=-lr)
                 if update_bias:
-                    bias.add_(b_saga, alpha=-lr)
+                    bias[:num_keep].add_(b_saga[:num_keep], alpha=-lr)
 
                 # update table and averages
                 residual += a_prev
@@ -210,84 +249,130 @@ def train_saga(weight, bias, loader, val_loader, *,
                     thr.join()
 
                 def do_work(_idx):
-                    a_table.index_copy_(0, _idx, shuttle)
+                    a_table[:, :num_keep].index_copy_(0, _idx,
+                                                      shuttle[:, :num_keep])
 
-                shuttle.copy_(residual, non_blocking=True)
+                shuttle[:, :num_keep].copy_(residual[:, :num_keep],
+                                            non_blocking=True)
                 thr = Thread(target=do_work, args=(idx.cpu(),))
                 thr.start()
 
                 # Update average gradients
-                avg_grad_update(w_grad_avg, w_saga, batch_size, n_ex)
-                avg_grad_update(b_grad_avg, b_saga, batch_size, n_ex)
+                avg_grad_update(w_grad_avg[:, :num_keep], w_saga[:, :num_keep],
+                                batch_size, n_ex)
+                avg_grad_update(b_grad_avg[:num_keep], b_saga[:num_keep],
+                                batch_size, n_ex)
 
                 # Thresholding operation
-                fast_threshold(weight, lr * lam)
+                fast_threshold(weight[:, :num_keep], lr * lam[:num_keep])
 
-                residual.pow_(2)
-                ch.sum(residual, dim=0, out=train_losses)
-                total_train_losses += train_losses
+                residual[:, :num_keep].pow_(2)
+                ch.sum(residual[:, :num_keep], dim=0,
+                       out=train_losses[:num_keep])
+                total_train_losses[:num_keep] += train_losses[:num_keep]
 
             # https://glmnet.stanford.edu/articles/glmnet.html#appendix-0-convergence-criteria-1
             prev_w -= weight
             prev_w.pow_(2)
             prev_w *= mm_sig.pow(2)[:, None]
             ch.max(prev_w, dim=0, out=(deltas, deltas_inds))
-            ch.lt(deltas, early_stop_eps, out=done_optimizing_inner)
+            ch.lt(deltas, early_stop_eps, out=done_opt_inner)
 
             data_to_log = {
                 'train_mse': total_train_losses / n_ex,
                 'val_mse': last_mse,
                 'lambda': lam,
-                'done_optimizing_inner': done_optimizing_inner,
-                'done_optimizing_outer': done_optimizing_outer
+                'last_lambda': last_lambda,
+                'done_optimizing_inner': done_opt_inner,
+                'still_optimizing_outer': still_opt_outer
             }
             if logger is not None:
                 for name, value in data_to_log.items():
                     logger.log(name, value.cpu().numpy())
+                logger.log_index_mapping(index_mapping.cpu().numpy())
 
             # Decrement lambdas for the ones done optimizing
             if t % early_stop_freq == early_stop_freq - 1:
-                """
-                    if done_optimizing_inner[output_ind]:
-                        cox_store['weights'].append_row({
-                            'index': output_ind,
-                            'lambda_ind': lambdas_done[output_ind],
-                            'lambda': lam[output_ind],
-                            'weight': weight[:, output_ind],
-                            'bias': bias[output_ind]
-                        })
-                """
-
-                lambdas_done += (done_optimizing_inner & ~done_optimizing_outer)
-                done_optimizing_outer[lambdas_done == num_lambdas] = True
+                lambdas_done += (done_opt_inner & still_opt_outer)
+                ch.eq(lambdas_done, num_lambdas, out=new_fin_mask)
+                # last_lambda &= done_opt_inner
+                new_fin_mask |= (last_lambda & done_opt_inner)
+                last_lambda[new_fin_mask] = False
 
                 # New value of the MSE
-                new_mse = eval_saga(weight, bias, val_loader,
-                                    train_stats, batch_size,
-                                    num_inputs, num_outputs)
+                new_mse = None
+                if val_loader:
+                    new_mse = eval_saga(weight, bias, val_loader,
+                                        train_stats, batch_size,
+                                        num_inputs, num_outputs,
+                                        index_mapping)
 
-                # Of the indices done optimizing, see if val loss got worse
-                got_worse[:] = (new_mse > last_mse) & done_optimizing_inner
+                    # Of the indices done optimizing, see if val loss got worse
+                    ch.greater_equal(new_mse, last_mse, out=got_worse)
+                else:
+                    got_worse[:] = True
+
+                got_worse &= done_opt_inner
+                got_worse &= still_opt_outer
+                # got_worse[:] = (new_mse >= last_mse) & done_opt_inner
 
                 # Wherever it got worse, stop optimizing and decrement lambda
-                lam[got_worse & ~done_optimizing_outer] /= lam_decay
-                done_optimizing_outer[got_worse] = True
+                # lam[got_worse & still_opt_outer] /= lam_decay
+                lam[got_worse & ~last_lambda] /= lam_decay
+                last_lambda[got_worse] = True
+                new_fin_mask &= still_opt_outer
+                still_opt_outer[new_fin_mask] = False
+
+                # Where (in the original indices) we are newly done
+                new_fin_inds = ch.where(new_fin_mask)[0].cpu()
+                new_done = len(new_fin_inds)
+                inds_to_swap = ch.arange(num_keep - new_done, num_keep)
+
+                inds_to_swap = inds_to_swap[still_opt_outer[inds_to_swap]]
+                new_fin_inds = new_fin_inds[new_fin_inds < num_keep - new_done]
+
+                for tens in [a_table, w_grad_avg, weight]:
+                    swap_inds(tens, inds_to_swap, new_fin_inds)
+
+                for tens in [bias, lam, b_grad_avg,
+                             still_opt_outer, index_mapping,
+                             lambdas_done, last_mse]:
+                    swap_inds(tens, inds_to_swap, new_fin_inds, 0)
+
+                num_keep = still_opt_outer.sum().cpu().item()
 
                 # Wherever we are done, update the val mse and lambda
-                last_mse[done_optimizing_inner] = new_mse[done_optimizing_inner]
-                lam[done_optimizing_inner & ~done_optimizing_outer] *= lam_decay
-                done_optimizing_inner[:] = False
+                if new_mse is not None:
+                    last_mse[done_opt_inner] = new_mse[done_opt_inner]
+                else:
+                    last_mse[done_opt_inner] = 0.
+                done_opt_inner &= still_opt_outer
+                done_opt_inner &= ~last_lambda
+                lam[done_opt_inner] *= lam_decay
+                done_opt_inner[:] = False
 
             total_train_losses[:] = 0.
-            if ch.all(ch.logical_or(lambdas_done >= num_lambdas, done_optimizing_outer)):
+            if ch.all(~still_opt_outer):
                 break
-            
+
             nnz = weight.nonzero().shape[0]
             total = weight.shape[0]
-            print(f"epoch: {t} | delta: {deltas.mean()} | "
-                  f"weight nnz {nnz}/{total} ({nnz/(weight.shape[1] * total):.4f}) | "
-                  f"{lambdas_done.float().mean():.2f} lambdas done on average")
+            avg_lambdas_done = lambdas_done.float().mean()
+            sparsity = nnz/(weight.shape[1] * total)
+            print(f"epoch: {t} | "
+                  f"delta: {deltas[still_opt_outer].mean()} | "
+                  f"weight nnz {nnz}/{total} ({sparsity:.4f}) | "
+                  f"{avg_lambdas_done:.2f} lambdas done on average | "
+                  f"{num_keep} examples left | "
+                  f"{last_lambda.sum()} last lambdas")
             t += 1
     except KeyboardInterrupt:
-        cox_store.close()
+        if logger is not None:
+            logger.flush()
         print('Interrupted, quitting...')
+
+    index_unmapping = ch.argsort(index_mapping)
+    weight[:] = weight[:, index_unmapping]
+    bias[:] = bias[index_unmapping]
+    lam[:] = lam[index_unmapping]
+    return lam
