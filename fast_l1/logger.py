@@ -72,9 +72,7 @@ def agg(dat):
     new_row = mmap[i, unindexer]
     if index is not None:
         return new_row[index]
-        # np.where(reindexer[i] == index)[0][0]]
-        # return mmap[i, np.where(reindexer[i] == index)[0][0]]
-    # row = mmap[i, reindexer[i]]
+
     if agg_fn:
         return agg_fn(new_row)
     return new_row
