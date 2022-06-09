@@ -5,7 +5,7 @@ https://github.com/pypa/sampleproject
 """
 
 # Always prefer setuptools over distutils
-from setuptools import setup, find_packages, Extension
+from setuptools import setup, find_packages
 # To use a consistent encoding
 from codecs import open
 from os import path
@@ -29,14 +29,14 @@ setup(
   long_description_content_type="text/markdown",
 
   # The project's main homepage.
-  url='https://github.com/MadryLab/datamodeler',
+  url='https://github.com/MadryLab/fast_l1',
 
   # Author details
   author='MadryLab',
   author_email='datamodels@mit.edu',
 
   # Choose your license
-  license_files = ('LICENSE.txt',),
+  license_files=('LICENSE.txt',),
 
 
   # See https://pypi.python.org/pypi?%4Aaction=list_classifiers
@@ -75,7 +75,7 @@ setup(
   #  Alternatively, if you want to distribute just a my_module.py, uncomment
   #  this:
   #    py_modules=["my_module"],
-  # 
+  #
   #  List run-time dependencies here.  These will be installed by pip when
   #  your project is installed. For an analysis of "install_requires" vs pip's
   #  requirements files see:
