@@ -74,10 +74,14 @@ def calc_stats(loader):
     return X_avg, X_std
 
 
-def get_num_examples(loader):
+def get_num_examples(loader, train_mode):
     largest_ind, n_ex = 0, 0.
     for bool_X, _, idx in loader:
-        n_ex += float(bool_X.shape[0])
+        if train_mode:
+            bool_X.logical_not_()
+            n_ex += bool_X.sum(0).float()
+        else:
+            n_ex += float(bool_X.shape[0])
         largest_ind = max(largest_ind, idx.max().cpu().item())
 
     print('Largest index', largest_ind)
@@ -86,7 +90,7 @@ def get_num_examples(loader):
 
 def eval_saga(weight, bias, loader, stats,
               batch_size, num_inputs, num_outputs,
-              index_mapping):
+              index_mapping, train_mode, y_slice):
     residual = ch.zeros((batch_size, num_outputs),
                         dtype=ch.float32, device=weight.device)
     total_loss = ch.zeros(num_outputs,
@@ -111,6 +115,11 @@ def eval_saga(weight, bias, loader, stats,
         y_buf[:] = y[:, index_mapping]
         y_buf -= bias
         ch.addmm(input=y_buf, mat1=X, mat2=weight, out=residual, beta=-1)
+        if train_mode:
+            bool_X.logical_not_()
+            residual *= bool_X[:, y_slice]
+            weight_ind = ch.arange(num_inputs)[y_slice]
+            residual += weight[weight_ind, ch.arange(weight.shape[1])]
 
         residual.pow_(2)
         losses = residual.sum(0)
@@ -138,8 +147,12 @@ def train_saga(weight, bias, loader, val_loader, *,
                lr, start_lams, lam_decay, num_lambdas,
                early_stop_freq=2, early_stop_eps=1e-5,
                logdir: Optional[str] = None,
-               update_bias=True):
-    largest_ind, n_ex = get_num_examples(loader)
+               update_bias=True, train_mode=False,
+               y_slice=slice(0, None)):
+    largest_ind, n_ex = get_num_examples(loader, train_mode)
+    if train_mode:
+        n_ex = n_ex[y_slice]
+
     zeros = tensor_factory(ch.float32, weight.device)
     bool_zeros = tensor_factory(ch.bool, weight.device)
 
@@ -152,8 +165,9 @@ def train_saga(weight, bias, loader, val_loader, *,
             'train_mse': np.float32,
             'val_mse': np.float32,
             'lambda': np.float32,
-            'last_lambda': np.bool_,
             'weight_norm': np.float32,
+            'weight_nz': np.float32,
+            'bias': np.float32,
             'done_optimizing_inner': np.bool_,
             'still_optimizing_outer': np.bool_
         }, field_size=num_outputs, cnk_size=10_000)
@@ -168,7 +182,6 @@ def train_saga(weight, bias, loader, val_loader, *,
 
     done_opt_inner = bool_zeros(num_outputs)
     still_opt_outer = ~bool_zeros(num_outputs)
-    last_lambda = bool_zeros(num_outputs)
     got_worse = bool_zeros(num_outputs)
 
     last_mse = zeros(num_outputs) + ch.inf
@@ -215,6 +228,12 @@ def train_saga(weight, bias, loader, val_loader, *,
 
                 X.copy_(bool_X)
                 normalize(X, mm_mu, mm_sig, X)
+                if train_mode:
+                    # bool_X = bool_X[y_slice] if y_slice is not None else bool_X
+                    bool_X.logical_not_()
+
+                # Effective batch size
+                B = bool_X.sum(0).float()[y_slice] if train_mode else float(batch_size)
 
                 # Compute residuals
                 y_buf[:, :num_keep] = y[:, index_mapping[:num_keep]]
@@ -223,16 +242,23 @@ def train_saga(weight, bias, loader, val_loader, *,
                 ch.addmm(input=y_buf[:, :num_keep], mat1=X,
                          mat2=weight[:, :num_keep],
                          out=residual[:, :num_keep], beta=-1)
+                if train_mode:
+                    residual *= bool_X[:, y_slice]
+                    weight_ind = ch.arange(num_inputs)[y_slice][:num_keep]
+                    residual[:, :num_keep] += weight[weight_ind, ch.arange(num_keep)]
 
                 residual -= a_prev
 
                 ch.mm(X.T, residual[:, :num_keep], out=w_saga[:, :num_keep])
+                if train_mode:
+                    weight_ind = ch.arange(num_inputs)[y_slice][:num_keep]
+                    w_saga[weight_ind, ch.arange(num_keep)] += residual[:, :num_keep].sum(0)
 
-                w_saga /= batch_size
+                w_saga /= B # batch_size
                 w_saga += w_grad_avg
 
                 ch.sum(residual[:, :num_keep], dim=0, out=b_saga[:num_keep])
-                b_saga /= batch_size
+                b_saga /= B # batch_size
                 b_saga += b_grad_avg
 
                 # Gradient steps for weight
@@ -258,10 +284,19 @@ def train_saga(weight, bias, loader, val_loader, *,
                 thr.start()
 
                 # Update average gradients
-                avg_grad_update(w_grad_avg[:, :num_keep], w_saga[:, :num_keep],
-                                batch_size, n_ex)
-                avg_grad_update(b_grad_avg[:num_keep], b_saga[:num_keep],
-                                batch_size, n_ex)
+                if train_mode:
+                    avg_grad_update(w_grad_avg[:, :num_keep], w_saga[:, :num_keep],
+                                    B[:num_keep], n_ex[:num_keep])
+                    avg_grad_update(b_grad_avg[:num_keep], b_saga[:num_keep],
+                                    B[:num_keep], n_ex[:num_keep])
+                else:
+                    avg_grad_update(w_grad_avg[:, :num_keep], w_saga[:, :num_keep],
+                                    B, n_ex)
+                    avg_grad_update(b_grad_avg[:num_keep], b_saga[:num_keep],
+                                    B, n_ex)
+
+                                # batch_size, n_ex)
+                                # batch_size, n_ex)
 
                 # Thresholding operation
                 fast_threshold(weight[:, :num_keep], lr * lam[:num_keep])
@@ -282,7 +317,9 @@ def train_saga(weight, bias, loader, val_loader, *,
                 'train_mse': total_train_losses / n_ex,
                 'val_mse': last_mse,
                 'lambda': lam,
-                'last_lambda': last_lambda,
+                'weight_norm': weight.norm(dim=0, p=1),
+                'weight_nz': weight.norm(dim=0, p=0),
+                'bias': bias,
                 'done_optimizing_inner': done_opt_inner,
                 'still_optimizing_outer': still_opt_outer
             }
@@ -290,14 +327,11 @@ def train_saga(weight, bias, loader, val_loader, *,
                 for name, value in data_to_log.items():
                     logger.log(name, value.cpu().numpy())
                 logger.log_index_mapping(index_mapping.cpu().numpy())
-
+            
             # Decrement lambdas for the ones done optimizing
             if t % early_stop_freq == early_stop_freq - 1:
                 lambdas_done += (done_opt_inner & still_opt_outer)
                 ch.eq(lambdas_done, num_lambdas, out=new_fin_mask)
-                # last_lambda &= done_opt_inner
-                new_fin_mask |= (last_lambda & done_opt_inner)
-                last_lambda[new_fin_mask] = False
 
                 # New value of the MSE
                 new_mse = None
@@ -305,7 +339,8 @@ def train_saga(weight, bias, loader, val_loader, *,
                     new_mse = eval_saga(weight, bias, val_loader,
                                         train_stats, batch_size,
                                         num_inputs, num_outputs,
-                                        index_mapping)
+                                        index_mapping, train_mode,
+                                        y_slice)
 
                     # Of the indices done optimizing, see if val loss got worse
                     ch.greater_equal(new_mse, last_mse, out=got_worse)
@@ -314,12 +349,9 @@ def train_saga(weight, bias, loader, val_loader, *,
 
                 got_worse &= done_opt_inner
                 got_worse &= still_opt_outer
-                # got_worse[:] = (new_mse >= last_mse) & done_opt_inner
+                new_fin_mask |= got_worse
 
                 # Wherever it got worse, stop optimizing and decrement lambda
-                # lam[got_worse & still_opt_outer] /= lam_decay
-                lam[got_worse & ~last_lambda] /= lam_decay
-                last_lambda[got_worse] = True
                 new_fin_mask &= still_opt_outer
                 still_opt_outer[new_fin_mask] = False
 
@@ -347,7 +379,6 @@ def train_saga(weight, bias, loader, val_loader, *,
                 else:
                     last_mse[done_opt_inner] = 0.
                 done_opt_inner &= still_opt_outer
-                done_opt_inner &= ~last_lambda
                 lam[done_opt_inner] *= lam_decay
                 done_opt_inner[:] = False
 
@@ -363,8 +394,7 @@ def train_saga(weight, bias, loader, val_loader, *,
                   f"delta: {deltas[still_opt_outer].mean()} | "
                   f"weight nnz {nnz}/{total} ({sparsity:.4f}) | "
                   f"{avg_lambdas_done:.2f} lambdas done on average | "
-                  f"{num_keep} examples left | "
-                  f"{last_lambda.sum()} last lambdas")
+                  f"{num_keep} examples left | ")
             t += 1
     except KeyboardInterrupt:
         if logger is not None:
