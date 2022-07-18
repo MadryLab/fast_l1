@@ -166,7 +166,10 @@ def train_saga(weight, bias, loader, val_loader, *,
     shuttle = zeros(batch_size, num_outputs).cpu().pin_memory()
 
     # Stateful variables
-    lam = start_lams.clone().to(weight.device)
+    # lam = start_lams.clone().to(weight.device)
+    start_lams = start_lams.to(weight.device)
+    num_lambdas += 1
+    lam = zeros(*bias.shape)
     w_grad_avg = zeros(*weight.shape)
     b_grad_avg = zeros(*bias.shape)
 
@@ -316,6 +319,7 @@ def train_saga(weight, bias, loader, val_loader, *,
                     # Of the indices done optimizing, see if val loss got worse
                     ch.gt(new_mse, last_mse, out=got_worse)
                     got_worse &= (lambdas_done >= min_lams_to_try)
+                    got_worse &= (weight.norm(dim=0, p=0) > 1)
 
                     best_lambdas = ch.where((new_mse <= best_mse) & done_opt_inner, 
                                              lam, best_lambdas)
@@ -356,7 +360,9 @@ def train_saga(weight, bias, loader, val_loader, *,
                 else:
                     last_mse[done_opt_inner] = 0.
                 done_opt_inner &= still_opt_outer
-                lam[done_opt_inner] *= lam_decay
+                lam[done_opt_inner & (lambdas_done == 1)] = \
+                    start_lams[done_opt_inner & (lambdas_done == 1)]
+                lam[done_opt_inner & (lambdas_done > 1)] *= lam_decay
                 done_opt_inner[:] = False
 
             total_train_losses[:] = 0.
