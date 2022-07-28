@@ -326,7 +326,7 @@ def train_saga(weight, bias, loader, val_loader, *,
                     best_mse = ch.where((new_mse <= best_mse) & done_opt_inner, 
                                          new_mse, best_mse)
                 else:
-                    got_worse[:] = True
+                    got_worse[:] = False
 
                 got_worse &= done_opt_inner
                 new_fin_mask |= got_worse
