@@ -218,7 +218,8 @@ def train_saga(weight, bias, loader, val_loader, *,
             prev_w[:] = weight
             # Try rearranging weight vector here
             for bool_X, y, idx in iterator:
-                a_prev[:, :num_keep].copy_(a_table[idx, :num_keep],
+                cpu_idx = idx.clone().cpu()
+                a_prev[:, :num_keep].copy_(a_table[cpu_idx, :num_keep],
                                            non_blocking=True)
 
                 X.copy_(bool_X)
@@ -321,9 +322,9 @@ def train_saga(weight, bias, loader, val_loader, *,
                     got_worse &= (lambdas_done >= min_lams_to_try)
                     got_worse &= (weight.norm(dim=0, p=0) > 1)
 
-                    best_lambdas = ch.where((new_mse <= best_mse) & done_opt_inner, 
+                    best_lambdas = ch.where((new_mse <= best_mse) & done_opt_inner,
                                              lam, best_lambdas)
-                    best_mse = ch.where((new_mse <= best_mse) & done_opt_inner, 
+                    best_mse = ch.where((new_mse <= best_mse) & done_opt_inner,
                                          new_mse, best_mse)
                 else:
                     got_worse[:] = False
@@ -338,7 +339,8 @@ def train_saga(weight, bias, loader, val_loader, *,
                 new_done = len(new_fin_inds)
                 inds_to_swap = ch.arange(num_keep - new_done, num_keep)
 
-                inds_to_swap = inds_to_swap[still_opt_outer[inds_to_swap]]
+                _inner = still_opt_outer[inds_to_swap].clone().cpu()
+                inds_to_swap = inds_to_swap[_inner]
                 new_fin_inds = new_fin_inds[new_fin_inds < num_keep - new_done]
 
                 for tens in [a_table, w_grad_avg, weight]:
