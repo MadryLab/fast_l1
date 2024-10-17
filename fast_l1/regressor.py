@@ -7,6 +7,34 @@ from tqdm import tqdm
 from cupy import ElementwiseKernel
 
 from fast_l1.logger import Logger
+from tqdm.auto import tqdm
+
+# Taken from https://github.com/libffcv/ffcv/issues/345
+# There is a mem leak in ffcv.  The following is a workaround:
+class FFCVClosingIterator:
+    def __init__(self, it):
+        self.it = it
+
+    def __next__(self):
+        return next(self.it)
+
+    def __iter__(self):
+        return self
+
+    def __del__(self):
+        self.it.close()
+        self.it.join()
+
+class FFCVClosingIterable:
+    def __init__(self, it):
+        self.it = it
+
+    def __iter__(self):
+        return FFCVClosingIterator(iter(self.it))
+
+def get_ffcv_iterator(loader):
+    return FFCVClosingIterable(loader)
+
 
 kernel = ElementwiseKernel(
     'float32 data, float32 lamb',
@@ -46,24 +74,28 @@ def normalize(X_bool, mean, std, X):
 
 # Calculate maximum regularization
 def calc_max_lambda(loader):
+    total = len(loader)
+    loader = get_ffcv_iterator(loader)
     n, y_sum = 0., 0.
     # calculate mean
-    for X, y, _ in loader:
+    for X, y, _ in tqdm(loader, desc='Calculating max lambda', total=total):
         y_sum += y.sum(dim=0).float()
         n += y.shape[0]
     y_bar = y_sum / n
 
     # calculate maximum regularization
     inner_products = 0
-    for X, y, _ in loader:
+    for X, y, _ in tqdm(loader):
         y_map = (y - y_bar)
         inner_products += X.T.float().mm(y_map)
     return ch.abs(inner_products).max(dim=0).values / n
 
 
 def calc_stats(loader):
+    total = len(loader)
+    loader = get_ffcv_iterator(loader)
     n, X_avg, X_std = 0., 0., 0.
-    for X, y, _ in loader:
+    for X, y, _ in tqdm(loader, desc='Calculating stats', total=total):
         X_avg += X.sum(dim=0).float()
         X_std += X.pow(2).sum(dim=0).float()
         n += y.shape[0]
@@ -76,11 +108,14 @@ def calc_stats(loader):
 
 def get_num_examples(loader):
     largest_ind, n_ex = 0, 0.
-    for bool_X, _, idx in loader:
+    total = len(loader)
+    loader = get_ffcv_iterator(loader)
+    for bool_X, _, idx in tqdm(loader, desc='Calculating num examples', total=total):
         n_ex += float(bool_X.shape[0])
         largest_ind = max(largest_ind, idx.max().cpu().item())
 
-    print('Largest index', largest_ind)
+    print('Largest index', largest_ind, flush=True)
+    print('Num examples', n_ex, flush=True)
     return largest_ind, n_ex
 
 
@@ -97,11 +132,12 @@ def eval_saga(weight, bias, loader, stats,
     y_buf = ch.empty(batch_size, num_outputs,
                      dtype=ch.float32, device=weight.device)
 
-    iterator = tqdm(loader)
+    total = len(loader)
+    iterator = get_ffcv_iterator(loader)
     total_loss[:] = 0.
     n_ex = 0
 
-    for bool_X, y, idx in iterator:
+    for bool_X, y, idx in tqdm(iterator, desc='Evaluating', total=total):
         # Previous residuals
         n_ex += bool_X.shape[0]
         X.copy_(bool_X)
@@ -213,11 +249,13 @@ def train_saga(weight, bias, loader, val_loader, *,
     num_keep = num_outputs
     try:
         while True:
-            iterator = tqdm(loader)
+            total = len(loader)
+            iterator = get_ffcv_iterator(loader)
             thr = None
             prev_w[:] = weight
+
             # Try rearranging weight vector here
-            for bool_X, y, idx in iterator:
+            for bool_X, y, idx in tqdm(iterator, desc='Training', total=total):
                 cpu_idx = idx.clone().cpu()
                 a_prev[:, :num_keep].copy_(a_table[cpu_idx, :num_keep],
                                            non_blocking=True)
